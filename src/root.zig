@@ -164,27 +164,41 @@ pub const Client = struct {
     /// Captures an event. A null `distinct_id` makes a personless event:
     /// a random distinct id, and no person profile.
     pub fn capture(self: *Client, event: []const u8, distinct_id: ?[]const u8, properties: anytype) CaptureError!Uuid {
-        return self.enqueue(event, distinct_id, distinct_id == null, properties);
+        return self.captureEvent(.{ .name = event, .distinct_id = distinct_id }, properties);
+    }
+
+    pub const Event = struct {
+        name: []const u8,
+        /// Null makes a personless event, as in `capture`.
+        distinct_id: ?[]const u8 = null,
+        /// The session of posthog-js (`$session_id`), which links the event
+        /// to the session and its replay.
+        session_id: ?[]const u8 = null,
+    };
+
+    /// `capture`, with the other fields of `Event`.
+    pub fn captureEvent(self: *Client, event: Event, properties: anytype) CaptureError!Uuid {
+        return self.enqueue(event.name, event.distinct_id, event.distinct_id == null, event.session_id, properties);
     }
 
     /// Sets properties on the person profile of `distinct_id`.
     pub fn set(self: *Client, distinct_id: []const u8, properties: anytype) CaptureError!Uuid {
         if (distinct_id.len == 0) return error.MissingId;
-        return self.enqueue("$set", distinct_id, false, .{ .@"$set" = properties });
+        return self.enqueue("$set", distinct_id, false, null, .{ .@"$set" = properties });
     }
 
     /// Sets properties on the person profile of `distinct_id`, only if they
     /// do not have a value.
     pub fn setOnce(self: *Client, distinct_id: []const u8, properties: anytype) CaptureError!Uuid {
         if (distinct_id.len == 0) return error.MissingId;
-        return self.enqueue("$set_once", distinct_id, false, .{ .@"$set_once" = properties });
+        return self.enqueue("$set_once", distinct_id, false, null, .{ .@"$set_once" = properties });
     }
 
     /// Makes `distinct_id` an alias of `previous_id`: both ids are then the
     /// same person.
     pub fn alias(self: *Client, previous_id: []const u8, distinct_id: []const u8) CaptureError!Uuid {
         if (previous_id.len == 0 or distinct_id.len == 0) return error.MissingId;
-        return self.enqueue("$create_alias", previous_id, false, .{
+        return self.enqueue("$create_alias", previous_id, false, null, .{
             .distinct_id = previous_id,
             .alias = distinct_id,
         });
@@ -194,14 +208,14 @@ pub const Client = struct {
     /// A null `distinct_id` is a random id, as in `posthog-python`.
     pub fn groupIdentify(self: *Client, group_type: []const u8, group_key: []const u8, distinct_id: ?[]const u8, properties: anytype) CaptureError!Uuid {
         if (group_type.len == 0 or group_key.len == 0) return error.MissingId;
-        return self.enqueue("$groupidentify", distinct_id, false, .{
+        return self.enqueue("$groupidentify", distinct_id, false, null, .{
             .@"$group_type" = group_type,
             .@"$group_key" = group_key,
             .@"$group_set" = properties,
         });
     }
 
-    fn enqueue(self: *Client, event: []const u8, distinct_id: ?[]const u8, personless: bool, properties: anytype) CaptureError!Uuid {
+    fn enqueue(self: *Client, event: []const u8, distinct_id: ?[]const u8, personless: bool, session_id: ?[]const u8, properties: anytype) CaptureError!Uuid {
         const io = self.io;
         const uuid = newUuid(io);
         var random_id: Uuid = undefined;
@@ -216,6 +230,7 @@ pub const Client = struct {
             .distinct_id = id,
             .timestamp_ns = now_ns,
             .personless = personless,
+            .session_id = session_id,
         }, properties);
         errdefer self.gpa.free(json);
 
@@ -598,6 +613,8 @@ const EventHeader = struct {
     distinct_id: []const u8,
     timestamp_ns: i96,
     personless: bool,
+    /// v1 has the session id at the top level, not in `properties`.
+    session_id: ?[]const u8 = null,
 };
 
 /// The event as a v1 JSON event. The uuid is first, for `eventUuid`.
@@ -617,6 +634,7 @@ fn encodeEvent(gpa: std.mem.Allocator, header: EventHeader, properties: anytype)
             process_person_profile: ?bool = null,
         },
         properties: Properties(P),
+        session_id: ?SafeString,
     } = .{
         .uuid = &header.uuid,
         .event = .{ .s = header.event },
@@ -624,6 +642,7 @@ fn encodeEvent(gpa: std.mem.Allocator, header: EventHeader, properties: anytype)
         .timestamp = formatTimestamp(&timestamp_buf, header.timestamp_ns),
         .options = .{ .process_person_profile = if (header.personless) false else null },
         .properties = .{ .value = if (empty) .{} else properties, .is_object = &is_object },
+        .session_id = if (header.session_id) |s| (if (s.len > 0) SafeString{ .s = s } else null) else null,
     };
 
     var w: std.Io.Writer.Allocating = .init(gpa);
@@ -660,7 +679,10 @@ fn Properties(comptime T: type) type {
 /// valid UTF-8: then each byte above 0x7f becomes U+FFFD. `std.json` writes
 /// a `[]const u8` that is not valid UTF-8 as an array of numbers, and the
 /// v1 server then rejects the whole batch.
-const SafeString = struct {
+///
+/// The client uses it for the event name and the ids. Use it in properties
+/// for text that is not always valid UTF-8, for example HTTP headers.
+pub const SafeString = struct {
     s: []const u8,
 
     pub fn jsonStringify(self: SafeString, jw: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -738,6 +760,16 @@ test encodeEvent {
     const empty = try encodeEvent(testing.allocator, personless, .{});
     defer testing.allocator.free(empty);
     try testing.expect(std.mem.endsWith(u8, empty, "\"options\":{\"process_person_profile\":false},\"properties\":{}}"));
+
+    var with_session = header;
+    with_session.session_id = "0192-session";
+    const session = try encodeEvent(testing.allocator, with_session, .{});
+    defer testing.allocator.free(session);
+    try testing.expect(std.mem.endsWith(u8, session, "\"properties\":{},\"session_id\":\"0192-session\"}"));
+    with_session.session_id = "";
+    const no_session = try encodeEvent(testing.allocator, with_session, .{});
+    defer testing.allocator.free(no_session);
+    try testing.expect(std.mem.indexOf(u8, no_session, "session_id") == null);
 
     // The envelope omits null options, but properties keep null values.
     const nulls = try encodeEvent(testing.allocator, header, .{ .note = @as(?[]const u8, null) });
