@@ -602,64 +602,103 @@ const EventHeader = struct {
 
 /// The event as a v1 JSON event. The uuid is first, for `eventUuid`.
 fn encodeEvent(gpa: std.mem.Allocator, header: EventHeader, properties: anytype) CaptureError![]u8 {
+    var timestamp_buf: [timestamp_len]u8 = undefined;
+    const T = @TypeOf(properties);
+    // `.{}` is an empty tuple, which `std.json` writes as `[]`.
+    const empty = T == @TypeOf(null) or (@typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".field_names.len == 0);
+    const P = if (empty) struct {} else T;
+    var is_object = true;
+    const event: struct {
+        uuid: []const u8,
+        event: SafeString,
+        distinct_id: SafeString,
+        timestamp: []const u8,
+        options: struct {
+            process_person_profile: ?bool = null,
+        },
+        properties: Properties(P),
+    } = .{
+        .uuid = &header.uuid,
+        .event = .{ .s = header.event },
+        .distinct_id = .{ .s = header.distinct_id },
+        .timestamp = formatTimestamp(&timestamp_buf, header.timestamp_ns),
+        .options = .{ .process_person_profile = if (header.personless) false else null },
+        .properties = .{ .value = if (empty) .{} else properties, .is_object = &is_object },
+    };
+
     var w: std.Io.Writer.Allocating = .init(gpa);
     defer w.deinit();
-    writeEvent(&w.writer, header, properties) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-        else => |e| return e,
-    };
+    // The v1 schema has no null options. `Properties` writes the
+    // properties with the default options, which keep null values.
+    std.json.Stringify.value(event, .{ .emit_null_optional_fields = false }, &w.writer) catch return error.OutOfMemory;
+    if (!is_object) return error.PropertiesNotObject;
     if (w.written().len > max_event_size) return error.EventTooLarge;
     return w.toOwnedSlice();
 }
 
-fn writeEvent(w: *std.Io.Writer, header: EventHeader, properties: anytype) !void {
-    var timestamp_buf: [timestamp_len]u8 = undefined;
-    try w.print("{{\"uuid\":\"{s}\",\"event\":", .{&header.uuid});
-    try writeString(w, header.event);
-    try w.writeAll(",\"distinct_id\":");
-    try writeString(w, header.distinct_id);
-    try w.print(",\"timestamp\":\"{s}\",\"options\":{{", .{formatTimestamp(&timestamp_buf, header.timestamp_ns)});
-    if (header.personless) try w.writeAll("\"process_person_profile\":false");
-    try w.writeAll("},\"properties\":");
+/// Writes `value` with the default `std.json` options, and sets
+/// `is_object` to false if it is not a JSON object. `jsonStringify` cannot
+/// return a different error than `Stringify.Error`.
+fn Properties(comptime T: type) type {
+    return struct {
+        value: T,
+        is_object: *bool,
 
-    const T = @TypeOf(properties);
-    // `.{}` is an empty tuple, which `std.json` writes as `[]`.
-    const empty = T == @TypeOf(null) or (@typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".field_names.len == 0);
-    if (empty) {
-        try w.writeAll("{}");
-    } else {
-        const start = w.end;
-        try std.json.Stringify.value(properties, .{}, w);
-        if (w.buffer[start] != '{') return error.PropertiesNotObject;
-    }
-    try w.writeByte('}');
+        pub fn jsonStringify(self: @This(), jw: *std.json.Stringify) std.json.Stringify.Error!void {
+            try jw.beginWriteRaw();
+            // The writer of `encodeEvent` keeps all the output in its
+            // buffer, so `end` is the start of the value.
+            const start = jw.writer.end;
+            try std.json.Stringify.value(self.value, .{}, jw.writer);
+            self.is_object.* = jw.writer.buffer[start] == '{';
+            jw.endWriteRaw();
+        }
+    };
 }
+
+/// A string that `std.json` writes as a JSON string also if it is not
+/// valid UTF-8: then each byte above 0x7f becomes U+FFFD. `std.json` writes
+/// a `[]const u8` that is not valid UTF-8 as an array of numbers, and the
+/// v1 server then rejects the whole batch.
+const SafeString = struct {
+    s: []const u8,
+
+    pub fn jsonStringify(self: SafeString, jw: *std.json.Stringify) std.json.Stringify.Error!void {
+        if (std.unicode.utf8ValidateSlice(self.s)) return jw.write(self.s);
+        try jw.beginWriteRaw();
+        try jw.writer.writeByte('"');
+        for (self.s) |c| {
+            if (c < 0x80) {
+                try std.json.Stringify.encodeJsonStringChars(&.{c}, .{}, jw.writer);
+            } else {
+                try jw.writer.writeAll("\\ufffd");
+            }
+        }
+        try jw.writer.writeByte('"');
+        jw.endWriteRaw();
+    }
+};
 
 /// The v1 batch envelope. The API key is in the `Authorization` header.
-fn writeBatch(w: *std.Io.Writer, created_at: []const u8, events: []const []u8, historical_migration: bool) std.Io.Writer.Error!void {
-    try w.print("{{\"created_at\":\"{s}\",", .{created_at});
-    if (historical_migration) try w.writeAll("\"historical_migration\":true,");
-    try w.writeAll("\"batch\":[");
-    for (events, 0..) |event, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.writeAll(event);
+/// The events are JSON from `encodeEvent`.
+fn writeBatch(w: *std.Io.Writer, created_at: []const u8, events: []const []u8, historical_migration: bool) std.json.Stringify.Error!void {
+    var jw: std.json.Stringify = .{ .writer = w };
+    try jw.beginObject();
+    try jw.objectField("created_at");
+    try jw.write(created_at);
+    if (historical_migration) {
+        try jw.objectField("historical_migration");
+        try jw.write(true);
     }
-    try w.writeAll("]}");
-}
-
-/// `s` as a JSON string. JSON must be UTF-8: if `s` is not valid UTF-8,
-/// each byte above 0x7f becomes U+FFFD.
-fn writeString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
-    if (std.unicode.utf8ValidateSlice(s)) return std.json.Stringify.encodeJsonString(s, .{}, w);
-    try w.writeByte('"');
-    for (s) |c| {
-        if (c < 0x80) {
-            try std.json.Stringify.encodeJsonStringChars(&.{c}, .{}, w);
-        } else {
-            try w.writeAll("\\ufffd");
-        }
+    try jw.objectField("batch");
+    try jw.beginArray();
+    for (events) |event| {
+        try jw.beginWriteRaw();
+        try jw.writer.writeAll(event);
+        jw.endWriteRaw();
     }
-    try w.writeByte('"');
+    try jw.endArray();
+    try jw.endObject();
 }
 
 const testing = std.testing;
@@ -699,6 +738,11 @@ test encodeEvent {
     const empty = try encodeEvent(testing.allocator, personless, .{});
     defer testing.allocator.free(empty);
     try testing.expect(std.mem.endsWith(u8, empty, "\"options\":{\"process_person_profile\":false},\"properties\":{}}"));
+
+    // The envelope omits null options, but properties keep null values.
+    const nulls = try encodeEvent(testing.allocator, header, .{ .note = @as(?[]const u8, null) });
+    defer testing.allocator.free(nulls);
+    try testing.expect(std.mem.endsWith(u8, nulls, "\"options\":{},\"properties\":{\"note\":null}}"));
 
     try testing.expectError(error.PropertiesNotObject, encodeEvent(testing.allocator, header, @as(u32, 3)));
 }
