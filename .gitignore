@@ -1,0 +1,15 @@
+# Zig build output and caches.
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# Local environment, for example POSTHOG_API_KEY.
+.env
+.env.*
+
+# Editors and operating systems.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
